@@ -1,0 +1,26 @@
+[general]
+creator=R package 'raster'
+created=2021-08-06 16:28:07
+[georeference]
+nrows=69
+ncols=161
+xmin=-866567.457845805
+ymin=4016625.60264603
+xmax=-765057.785589733
+ymax=4060129.74789863
+projection=+proj=utm +zone=19 +datum=NAD83 +units=m +no_defs
+[data]
+datatype=FLT4S
+byteorder=little
+nbands=1
+bandorder=BIL
+categorical=FALSE
+minvalue=265
+maxvalue=1934.28875
+nodatavalue=-3.4e+38
+[legend]
+legendtype=
+values=
+color=
+[description]
+layername=alt

@@ -1,0 +1,946 @@
+---
+title: "GSMNP"
+author: "Alex Baecher"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+# load packages
+
+pacman::p_load(
+  "beepr",
+  "colortools",  
+  "corrplot",
+  "cowplot",
+  "dynatopmodel",
+  "elevatr",
+  "ggpubr",
+  "ggregplot",
+  "ggspatial",
+  "ggthemes",
+  "Hmisc",
+  "INLA",
+  "inlabru",
+  "INLAutils",
+  "lubridate",
+  "mapproj",
+  "MCMCglmm",
+  "osmdata",
+  "RandomFields",
+  "raster",
+  "readr",
+  "rgdal",
+  "rgeos",
+  "rgl",
+  "scales",
+  "sf",
+  "shadowtext",
+  "sp",
+  "spatialEco",
+  "spatstat",
+  "splines",
+  "terra",
+  "tidyverse", 
+  "tigris",
+  "viridis",
+  "wesanderson")
+
+source("TWI_script.R")
+source("spde_book_scripts.R")
+source("fit_lgcp.R")
+
+proj <- "+proj=utm +zone=19 +ellps=GRS80 +datum=NAD83"
+```
+
+```{r message=FALSE, warning=FALSE}
+df_raw <- read_csv("data/SalamanderData_AlexBaecher.csv", na = c(""," ","<NA>","NA",".",".."))
+
+df <- df_raw %>%
+  # Filter out NAs from important columns
+  filter(!is.na(Latitude),
+         !is.na(Longitude),
+         !is.na(EvidenceDate),
+         !is.na(StudyId),
+         !is.na(Project),
+         !ObservationMethod %in% c("Trapped", "unspecified"),
+         Project == "Project: ATBI Amphibians. IRMA Research Permit and Reporting System StudyID: GRSM-00105") %>%
+  # Select only columns for study id, localities, and species
+  select(EvidenceDate,
+         Latitude, 
+         Longitude, 
+         StudyId, 
+         Genus, 
+         Species,
+         Project,
+         Habitat) %>%
+  # Rename date column
+  rename(time = EvidenceDate) %>%
+  # Begin manipulating data to consolidate multiple observations into a counts column
+  group_by(across(everything())) %>%
+  mutate(count = n(),
+         time = mdy(time),
+         year = year(time),
+         decade = format(floor_date(time, years(10)), "%Y"),
+         sub_year = as.numeric(substring(year, first = 4))) %>%
+  # Filter out observations with problematic date information
+  filter(!is.na(decade)) %>%
+  ungroup() %>%
+  distinct()
+
+df_count_spp <- df %>%
+  select(-Genus) %>%
+  pivot_wider(names_from = Species, values_from = count, values_fill = 0) %>%
+  select(-time) %>%
+  rename("EURWIL" = "Eurycea wilderae", 
+         "DESMON" = "Desmognathus monticola", 
+         "DESOCO" = "Desmognathus ocoee",
+         "PLEJOR" = "Plethodon jordani",
+         "DESIMI" = "Desmognathus imitator",
+         "DESWRI" = "Desmognathus wrighti") %>%
+  mutate(decade = as.factor(decade))
+
+df_R <- df_count_spp %>%
+  mutate_if(is.integer, function(x){ifelse(x > 0, 1, 0)}) %>%
+  mutate(rich = dplyr::select(., EURWIL:DESWRI) %>% rowSums()) %>%
+  select(Latitude, Longitude, StudyId, year, decade, rich) 
+
+df_count <- df_count_spp %>%
+  pivot_longer(cols = c(EURWIL,DESMON,DESOCO,PLEJOR,DESIMI,DESWRI), values_to = "count", names_to = "Species") 
+
+df_count_pjor <- df_count %>%
+  filter(Species == "PLEJOR")
+
+```
+
+```{r}
+# Color palette
+pal <- wes_palette("Zissou1", 256, type = "continuous")
+```
+
+```{r}
+# states <- states(class = "sp") %>%
+#   subset(NAME %in% c("Tennessee", "North Carolina", "Mississippi", "Alabama",
+#                      "Georgia", "Florida", "South Carolina", "North Carolina")) %>%
+#   spTransform(proj)
+# 
+# write_rds(states, "data/se.rds")
+states <- read_rds("data/se.rds")
+
+# Download polygon for TN and NC
+tn_nc <- states %>%
+  subset(NAME %in% c("Tennessee", "North Carolina"))
+
+# Create polygon for GSMNP
+gsmnp <- readOGR("shapefiles/GRSM_BOUNDARY_POLYGON.shp") %>%
+  subset(SHAPE_Area > 2e+08) %>%
+  spTransform(proj)
+
+# Convert salamander dataframe to spatialpointsdataframe
+gsmnp_spdf <- sp::SpatialPointsDataFrame(data = df, 
+                                              coords = dplyr::select(df, Longitude, Latitude), 
+                                              proj4string = crs("+proj=longlat +datum=NAD83 +no_defs")) %>%
+  spTransform(proj) %>%
+  erase.point(gsmnp, inside = F)
+gsmnp_spdf$Latitude_utm <- gsmnp_spdf@coords[,2]
+gsmnp_spdf$Longitude_utm <- gsmnp_spdf@coords[,1]
+
+df_R_spdf <- sp::SpatialPointsDataFrame(data = df_R, 
+                                              coords = dplyr::select(df_R, Longitude, Latitude), 
+                                              proj4string = crs("+proj=longlat +datum=NAD83 +no_defs")) %>%
+  spTransform(proj) %>%
+  erase.point(gsmnp, inside = F)
+df_R_spdf$Latitude_utm <- df_R_spdf@coords[,2]
+df_R_spdf$Longitude_utm <- df_R_spdf@coords[,1]
+
+df_count_pjor_spdf <- sp::SpatialPointsDataFrame(data = df_count_pjor, 
+                                              coords = dplyr::select(df_count_pjor, Longitude, Latitude), 
+                                              proj4string = crs("+proj=longlat +datum=NAD83 +no_defs")) %>%
+  spTransform(proj) %>%
+  erase.point(gsmnp, inside = F)
+df_count_pjor_spdf$Latitude_utm <- df_count_pjor_spdf@coords[,2]
+df_count_pjor_spdf$Longitude_utm <- df_count_pjor_spdf@coords[,1]
+
+```
+
+```{r}
+gsmnp_trails_sf <- readOGR("shapefiles/GRSM_TRAILS.shp") %>%
+  spTransform(proj) %>%
+  gIntersection(gsmnp) %>%
+  st_as_sf()
+```
+
+```{r}
+ext <- extent(gsmnp) %>%
+  as("SpatialPolygons") %>%
+  gBuffer(width = 9000, byid = T) %>%
+  spsample(1000, "regular")
+crs(ext) <- crs(tn_nc)
+
+plot(gsmnp, col = "grey80"); points(ext, pch = "+", col = "grey20"); lines(tn_nc, col = "maroon"); box(lwd = 2)
+```
+
+```{r}
+rescale_raster <- function(raster, mnv, mxv){
+  mnv <- raster::cellStats(raster, "min")
+  mxv <- raster::cellStats(raster, "max")
+  x <- (raster - mnv) / (mxv - mnv)
+  return(x)
+}
+
+ext_buff <- extent(-871568.4 + 5000,
+                   -764399.9 - 1000,
+                   4011977 + 5000,
+                   4063126 - 3000) %>%
+  as("SpatialPolygons")
+
+alt_gsmnp_raw <- elevatr::get_elev_raster(ext,
+                                      prj = proj,
+                                      z = 12) %>%
+  crop(ext_buff)
+names(alt_gsmnp_raw) <- "alt"
+write_rds(alt_gsmnp_raw, "alt_gsmnp.rds")
+
+# alt_gsmnp <- read_rds("data/alt_gsmnp.rds") %>%
+#   aggregate(fact = 2) 
+# 
+# alt_gsmnp %>%
+#   aggregate(fact = 20) %>%
+#   writeRaster("alt_gsmnp_agg.grd", overwrite = T)
+
+# eco_lf <- raster("data/eco_landform_app.tif") %>%
+#   projectRaster(alt_gsmnp) %>%
+#   round(0) 
+# 
+# 
+# eco_lf_simp <- raster::reclassify(eco_lf, matrix(c(1,2,7, 
+#                                                    2,6,6,
+#                                                    6,7,5,
+#                                                    7,10,4,
+#                                                    10,11,3,
+#                                                    11,14,2,
+#                                                    14,16,1), 
+#                                                  ncol = 3, 
+#                                                  byrow = T))
+
+
+hillShade_gsmnp <- hillShade(terrain(alt_gsmnp, opt = "slope"),
+                             terrain(alt_gsmnp, opt = "aspect")) %>%
+  crop(ext_buff) 
+
+gsmnp_ext <- tn_nc %>%
+  subset(NAME == "Tennessee") %>%
+  gIntersection(ext_buff)
+
+```
+
+#` Bioclimatic variables (to match with soil clim data)
+#` BIO1 = Annual Mean Temperature                                    ! important temp variable for salamanders     (bio1)
+#` BIO2 = Mean Diurnal Range (Mean of monthly (max temp - min temp)) 
+#` BIO3 = Isothermality (BIO2/BIO7) (×100)
+#' BIO4 = Temperature Seasonality (standard deviation ×100)          ! important temp variable for salamanders     (bio4)
+#' BIO5 = Max Temperature of Warmest Month                           ! important temp variable for salamanders     (bio5)
+#' BIO6 = Min Temperature of Coldest Month                           ! important temp variable for salamanders     (bio6)
+#' BIO7 = Temperature Annual Range (BIO5-BIO6)                       ! important temp variable for salamanders     (bio7)
+#' BIO8 = Mean Temperature of Wettest Quarter
+#' BIO9 = Mean Temperature of Driest Quarter
+#' BIO10 = Mean Temperature of Warmest Quarter
+#' BIO11 = Mean Temperature of Coldest Quarter
+#' BIO12 = Annual Precipitation                                      ! important moisture variable for salamanders (bio12)
+#' BIO13 = Precipitation of Wettest Month
+#' BIO14 = Precipitation of Driest Month
+#' BIO15 = Precipitation Seasonality (Coefficient of Variation)      ! important moisture variable for salamanders (bio15)
+#' BIO16 = Precipitation of Wettest Quarter
+#' BIO17 = Precipitation of Driest Quarter                           ! important moisture variable for salamanders (bio17)
+#' BIO18 = Precipitation of Warmest Quarter 
+#' BIO19 = Precipitation of Coldest Quarter
+
+```{r}
+# download.file(url = paste('https://databank.illinois.edu/datafiles/k7adc/download'),
+#               destfile = "microclimate.zip", mode='wb', cacheOK=FALSE)
+# 
+# gsmnp_centroid <- gCentroid(gsmnp) %>%
+#   spTransform("+proj=longlat +zone=17 +datum=NAD83 +units=m +no_defs")
+# 
+# gsmnp_wc_proj <- gsmnp %>%
+#   spTransform("+proj=longlat +datum=WGS84 +no_defs")
+# 
+# bio <- raster::getData("worldclim",
+#                         var = "bio",
+#                         res = 0.5,
+#                         lon = gsmnp_centroid@coords[1],
+#                         lat = gsmnp_centroid@coords[2]) %>%
+#   crop(gsmnp_wc_proj) %>%
+#   projectRaster(alt_gsmnp) %>%
+#   resample(alt_gsmnp, method = "bilinear")
+# 
+# wc_vars <- stack(bio$bio1_13, bio$bio4_13, bio$bio5_13, bio$bio6_13, bio$bio7_13, bio$bio12_13, bio$bio15_13)
+# names(wc_vars) <- c("Mean Temperature", "Temperature Seasonality", "Max Temperature",
+#                     "Min Temperature", "Temperature Range", "Precipitation",
+#                     "Precipitation Seasonality")
+# names(wc_vars) <- wc_vars %>%
+#   names() %>%
+#   gsub("\\.", "_", .) %>%
+#   tolower()
+# write_rds(wc_vars, "data/wc_vars.rds")
+
+wc_vars <- read_rds("data/wc_vars.rds")
+
+```
+
+```{r message=FALSE, warning=FALSE}
+tn_ext <- tn_nc %>%
+  subset(NAME == "Tennessee") %>%
+  gIntersection(as(extent(alt_gsmnp), "SpatialPolygons"))
+
+gsmnp_inset_ext <- ext_buff %>%
+  extent()
+
+states_crop <- states %>%
+  extent()
+states_crop[3] <- 2810173
+
+states_cropped <- states %>%
+  raster::intersect(states_crop) %>%
+  smoothr::smooth("spline")
+
+states_inset <- ggplot(states_cropped) +
+  geom_polygon(aes(x = long, y = lat, group = group), col = "grey40", fill = "white", size = 0.12, alpha = 0.7) +
+  annotate(geom = "rect",
+           xmin = gsmnp_inset_ext[1],
+           xmax = gsmnp_inset_ext[2],
+           ymin = gsmnp_inset_ext[3],
+           ymax = gsmnp_inset_ext[4],
+           colour = "maroon", fill = NA, size = 0.5) +
+  annotate(geom = "text", label = "Tennessee", x = -856682 - 240000, y = 4053680 + 70000, size = 1.3, fontface = 2, angle = -12) +
+  annotate(geom = "text", label = "North Carolina", x = -855000 + 445000, y = 4015190 - 9000, size = 1.3, fontface = 2, angle = -6) +
+  theme_void() +
+  coord_quickmap()
+
+cols <- complementary(pal[256/3])[2] %>%
+  dev.off()
+```
+
+```{r}
+# create extent object using sp object
+gsmnp_ext_obj <- gsmnp %>%
+  spTransform("+proj=longlat +datum=WGS84 +no_defs") %>%
+  extent()
+
+## set parameters to gain water body information
+long_range <- c(gsmnp_ext_obj[1],gsmnp_ext_obj[2]); lat_range <- c(gsmnp_ext_obj[3],gsmnp_ext_obj[4])
+osm_bbox <- c(long_range[1],lat_range[1], long_range[2],lat_range[2])
+
+gsmnp_water_sp <- opq(osm_bbox) %>%
+  add_osm_feature("water") %>%
+  osmdata_sp()
+
+# gsmnp_water <- spTransform(gsmnp_water_sp$osm_polygons, crs(gsmnp)) %>%
+#   gIntersection(as(extent(gsmnp), "SpatialPolygons")) %>%
+#   st_as_sf()
+
+## download waterways data
+gsmnp_streams_sp <- opq(osm_bbox) %>%
+  add_osm_feature(key = "waterway") %>%
+  osmdata_sp()
+
+## transform waterways data into an sf object
+# gsmnp_streams <- spTransform(gsmnp_streams_sp$osm_lines, crs(gsmnp)) %>%
+#   gIntersection(gsmnp) %>%
+#   st_as_sf()
+# write_rds(gsmnp_streams, "data/streams.rds")
+```
+
+```{r}
+gsmnp_water_sf <- read_rds("data/water.rds")
+gsmnp_streams_sf <- read_rds("data/streams.rds")
+
+gsmnp_simp <- gsmnp %>%
+  gSimplify(1000) %>%
+  smoothr::smooth("ksmooth") %>%
+  gBuffer(5000, byid = T) %>%
+  smoothr::drop_crumbs(units::set_units(10, km^2))
+
+```
+
+```{r}
+gsmnp_streams_vect <- as_Spatial(gsmnp_streams_sf) %>%
+  terra::vect()
+
+gsmnp_rast <- terra::rast(alt_gsmnp) > Inf
+
+gsmnp_streams_raster <- terra::rasterize(gsmnp_streams_vect, gsmnp_rast) %>%
+  terra::distance(grid = T) %>%
+  raster()
+
+# usa_gsmnp <- alt_gsmnp %>%
+#   create_layers(); beep("ping")
+# write_rds(usa_gsmnp, "data/usa_gsmnp.rds")
+usa_gsmnp <- read_rds("data/usa_gsmnp.rds") 
+
+gsmnp_trails_raster <- terra::rasterize(terra::vect(as_Spatial(gsmnp_trails_sf)), gsmnp_rast) %>%
+  terra::distance(grid = T) %>%
+  raster() 
+rm(gsmnp_rast)
+
+```
+
+```{r}
+gg_gsmnp <- ggplot() +
+  geom_raster(data = as.data.frame(alt_gsmnp, xy = T), aes(x = x, y = y, fill = alt)) +
+  geom_raster(data = as.data.frame(hillShade_gsmnp, xy = T), aes(x = x, y = y, alpha = 1 - layer), fill = "gray20") +
+  geom_sf(data = gsmnp_streams_sf, col = "light blue", alpha = 0.3, size = 0.2) +
+  geom_sf(data = gsmnp_water_sf, col = "steelblue4", alpha = 0.5) +
+  geom_sf(data = gsmnp_trails_sf, col = "grey20", size = 0.5, alpha = 0.5) +
+  geom_polygon(data = gsmnp_ext, aes(x = long, y = lat, group = group), col = cols, fill = NA, size = 0.5, alpha = 0.3) +
+  geom_polygon(data = gsmnp, aes(x = long, y = lat), col = "grey20", fill = NA, size = 0.25, alpha = 0.1) +
+  geom_polygon(data = as(extent(alt_gsmnp), "SpatialPolygons"), aes(x = long, y = lat), col = "black", fill = NA, size = 0.5) +
+  geom_shadowtext(aes(label = "Tennessee"), x = -856682 - 1100, y = 4053680 + 3500, size = 5, colour = "white") +
+  geom_shadowtext(aes(label = "North Carolina"), x = -855000 - 400, y = 4015190 + 5000, size = 5, colour = "white") +
+  ggtitle("Great Smoky Mountains National Park") +
+  scale_fill_gradientn("Elevation (m)", colors = pal, na.value = NA, guide = guide_colorbar(frame.colour = "grey30", ticks.colour = "grey30")) +
+  scale_alpha(guide = FALSE, range = c(0,1)) +
+  annotation_north_arrow(height = unit(1.1, "cm"), width = unit(1.1, "cm"),
+                         pad_x = unit(13.4, "cm"), pad_y = unit(1.0, "cm")) +
+  annotation_scale(width_hint = 0.1, height = unit(0.2, "cm"), pad_x = unit(13.0, "cm"), pad_y = unit(0.6, "cm")) +
+  theme_map() +
+  theme(plot.margin = margin(0.5,0,0,0, "cm"),
+        plot.title = element_text(hjust = 0.5, size = 15, face = 2),
+        legend.position = c(0.24, 0.83),
+        legend.direction = "horizontal",
+        legend.background = element_rect(colour = "black", fill = alpha("white", 0.7)),
+        legend.key = element_rect(colour = "black", size = 4),
+        legend.key.width = unit(0.6, "cm"),
+        legend.key.size = unit(0.3, "cm"),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 5),
+        legend.margin = margin(t = 0.1, b = 0.1, r = 0.3, l = 0.3, unit = "cm")); gg_gsmnp
+
+gg_comp <- ggdraw() +
+  draw_plot(gg_gsmnp) +
+  draw_plot(states_inset, x = 0.76, y = 0.058, width = 0.25, height = 0.25)
+ggsave("figures/gg_gsmnp_pal.jpeg", width = 8, height = 4, units = "in", dpi = 600)
+
+# gg_data <- gg_comp +
+#   geom_point(data = df_sub_R_spdf@data, aes(x = Longitude_utm, y = Latitude_utm, size = rich), shape = 1, alpha = 0.6, col = "black")
+# 
+# ggplot() +
+#   geom_raster(data = as.data.frame(alt_gsmnp_agg, xy = T), aes(x = x, y = y, fill = alt)) +
+#   geom_raster(data = as.data.frame(hillShade_gsmnp_agg, xy = T), aes(x = x, y = y, alpha = 1 - layer), fill = "gray20") +
+#   geom_point(data = as.data.frame(gsmnp_spdf), aes(x = Longitude_utm, y = Latitude_utm, col = Species), shape = 3, size = 2) +
+#   geom_polygon(data = gsmnp_ext, aes(x = long, y = lat, group = group), fill = NA, col = "maroon", size = 0.25) +
+#   geom_polygon(data = gsmnp, aes(x = long, y = lat), fill = NA, col = "grey20", size = 0.25) +
+#   geom_polygon(data = as(extent(alt_gsmnp), "SpatialPolygons"), aes(x = long, y = lat), fill = NA, col = "black", size = 0.25) +
+#   facet_wrap(~year) +
+#   scale_fill_gradientn("Elevation (m)", colors = pal, na.value = NA) +
+#   scale_alpha(guide = FALSE, range = c(0,1)) +
+#   theme_map() +
+#   theme(legend.position = "bottom");
+# ggsave("figures/gg_gsmnp_pal_species_year.jpeg", width = 12, height = 10, units = "in", dpi = 600)
+```
+
+```{r}
+aggfact <- 20
+
+cov_stack <- stack(
+  1-rescale_raster(eco_lf),
+  alt_gsmnp,
+  terrain(alt_gsmnp, opt = "slope"),
+  terrain(alt_gsmnp, opt = "aspect"),
+  terrain(alt_gsmnp, opt = "TPI"),
+  terrain(alt_gsmnp, opt = "roughness"),
+  terrain(alt_gsmnp, opt = "flowdir"),
+  gsmnp_streams_raster,
+  gsmnp_trails_raster,
+  usa_gsmnp$twi,
+  wc_vars) %>%
+  raster::crop(gsmnp) %>%
+  raster::mask(gsmnp) %>%
+  scale() %>%
+  raster::aggregate(fact = aggfact); beep("ping")
+
+cov_stack <- eco_lf_simp %>%
+  raster::crop(gsmnp) %>%
+  raster::mask(gsmnp) %>%
+  aggregate(fact = aggfact, fun = modal, na.rm = T) %>%
+  stack(cov_stack)
+
+names(cov_stack) <- c("ecolf_d","ecolf_c", "alt", "slope", "aspect", "TPI" , "rough", "flow", "stream", "trails", "twi", names(wc_vars))
+
+cov_df <- as.data.frame(xyFromCell(cov_stack, cell = 1:ncell(cov_stack))) %>%
+  mutate(
+    slope = values(cov_stack$slope),
+    aspect = values(cov_stack$aspect),
+    elev = values(cov_stack$alt),
+    ecolf_d = as.factor(round(values(cov_stack$ecolf_d), 0)),
+    ecolf_c = values(cov_stack$ecolf_c),
+    tpi = values(cov_stack$TPI),
+    rough = values(cov_stack$rough),
+    flow = values(cov_stack$flow),
+    stream = values(cov_stack$stream),
+    trails = values(cov_stack$trails),
+    twi = values(cov_stack$twi),
+    mean_temp = values(cov_stack$mean_temperature),
+    temp_season = values(cov_stack$temperature_seasonality),
+    max_temp = values(cov_stack$max_temperature),
+    min_temp = values(cov_stack$min_temperature),
+    temp_range = values(cov_stack$temperature_range),    
+    prec = values(cov_stack$precipitation),
+    prec_season = values(cov_stack$precipitation_seasonality)) %>%
+  as.data.frame() 
+
+is.nan.data.frame <- function(x)
+do.call(cbind, lapply(x, is.nan))
+
+cov_df[is.nan(cov_df)] <- NA
+
+plot(cov_df$twi~cov_df$ecolf_c)
+plot(cov_df$aspect~cov_df$ecolf_c)
+plot(cov_df$slope~cov_df$ecolf_c)
+plot(cov_df$elev, cov_df$ecolf_c)
+plot(cov_df$rough~cov_df$ecolf_c)
+plot(cov_df$flow~cov_df$ecolf_c)
+plot(cov_df$stream~cov_df$ecolf_c)
+plot(cov_df$trails~cov_df$ecolf_c)
+
+boxplot(cov_df$tpi~cov_df$ecolf_d)
+boxplot(cov_df$twi~cov_df$ecolf_d)
+boxplot(cov_df$aspect~cov_df$ecolf_d)
+boxplot(cov_df$slope~cov_df$ecolf_d)
+boxplot(cov_df$elev~cov_df$ecolf_d)
+boxplot(cov_df$rough~cov_df$ecolf_d)
+boxplot(cov_df$flow~cov_df$ecolf_d)
+boxplot(cov_df$stream~cov_df$ecolf_d)
+boxplot(cov_df$trails~cov_df$ecolf_d)
+
+```
+
+```{r}
+cor <- cov_df %>%
+  na.omit() %>%
+  as.matrix() %>%
+  cor()
+
+cor %>% 
+  as.data.frame() %>%
+  abs() > 0.7
+
+corrplot.mixed(cor)
+
+library(usdm)
+options(scipen = 999)
+vif <- vif(cov_stack) 
+vif # aspect, TPI, flow, stream, twi
+```
+
+Modeling the data as geostatistical data
+
+```{r}
+df_count_pjor_spdf@data <- bind_cols(
+  data.frame(
+    ecolf_c = raster::extract(cov_stack$ecolf_c, df_count_pjor_spdf),
+    ecolf_d = raster::extract(cov_stack$ecolf_d, df_count_pjor_spdf),
+    slope = raster::extract(cov_stack$slope, df_count_pjor_spdf),
+    aspect = raster::extract(cov_stack$aspect, df_count_pjor_spdf),
+    elev = raster::extract(cov_stack$alt, df_count_pjor_spdf),
+    tpi = raster::extract(cov_stack$TPI, df_count_pjor_spdf),
+    rough = raster::extract(cov_stack$rough, df_count_pjor_spdf),
+    flow = raster::extract(cov_stack$flow, df_count_pjor_spdf),
+    stream = raster::extract(cov_stack$stream, df_count_pjor_spdf),
+    trails = raster::extract(cov_stack$trails, df_count_pjor_spdf),
+    twi = raster::extract(cov_stack$twi, df_count_pjor_spdf),
+    mean_temp = raster::extract(cov_stack$mean_temperature, df_count_pjor_spdf),
+    temp_season = raster::extract(cov_stack$temperature_seasonality, df_count_pjor_spdf),
+    max_temp = raster::extract(cov_stack$max_temperature, df_count_pjor_spdf),
+    min_temp = raster::extract(cov_stack$min_temperature, df_count_pjor_spdf),
+    temp_range = raster::extract(cov_stack$temperature_range, df_count_pjor_spdf),   
+    prec = raster::extract(cov_stack$precipitation, df_count_pjor_spdf),
+    prec_season = raster::extract(cov_stack$precipitation_seasonality, df_count_pjor_spdf)),
+  dplyr::select(
+    df_count_pjor_spdf@data,
+    c("decade",
+      "Latitude",
+      "Longitude",
+      "StudyId",
+      "count",
+      "year"))) %>%
+  mutate(
+    Longitude = scale(Longitude),
+    Latitude =  scale(Latitude))
+
+
+plot(df_count_pjor_spdf@data$count~df_count_pjor_spdf@data$ecolf_c); abline(lm(count~ecolf_c, data = df_count_pjor_spdf@data))
+
+
+df_count_pjor_spdf <- df_count_pjor_spdf %>%
+  erase.point(gsmnp_simp, inside = F)
+
+df_count_pjor_spdf_mesh <- inla.mesh.2d(boundary = list(gsmnp_simp), 
+             loc = df_count_pjor_spdf@coords, 
+             cutoff = 1,
+             max.edge = c(1000, Inf)) # 1000, 20000 (for hi res preds)
+
+jpeg("figures/mesh_count.jpeg", units = "in", width = 7, height = 6, res = 600)
+plot(df_count_pjor_spdf_mesh); points(df_count_pjor_spdf, col = "red")
+dev.off()
+
+```
+
+```{r}
+A_count_pred <- inla.spde.make.A(df_count_pjor_spdf_mesh, loc = as.matrix(cov_df[c("x","y")]))
+A_count_est <- inla.spde.make.A(df_count_pjor_spdf_mesh, loc = df_count_pjor_spdf@coords)
+
+count_spde <- inla.spde2.matern(mesh = df_count_pjor_spdf_mesh)
+s_ind_count <- inla.spde.make.index(name = "sf2",
+                                n.spde = count_spde$n.spde)
+
+obs_stack_count <- inla.stack(data = list(y = df_count_pjor_spdf$count),
+                    A = list(A_count_est,
+                             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+                    effects = list(sf2 = s_ind_count,
+                                   Intercept =   rep(1, nrow(df_count_pjor_spdf)),
+                                   slope =       df_count_pjor_spdf@data$slope,
+                                   aspect =      df_count_pjor_spdf@data$aspect,
+                                   ecolf_c =     df_count_pjor_spdf@data$ecolf_c,
+                                   ecolf_d =     df_count_pjor_spdf@data$ecolf_d,
+                                   tpi =         df_count_pjor_spdf@data$tpi,
+                                   rough =       df_count_pjor_spdf@data$rough,
+                                   flow =        df_count_pjor_spdf@data$flow,
+                                   stream =      df_count_pjor_spdf@data$stream,
+                                   trails =      df_count_pjor_spdf@data$trails, 
+                                   twi =         df_count_pjor_spdf@data$twi,
+                                   elev =        df_count_pjor_spdf@data$elev,
+                                   mean_temp =   df_count_pjor_spdf@data$mean_temp,
+                                   temp_season = df_count_pjor_spdf@data$temp_season,
+                                   max_temp =    df_count_pjor_spdf@data$max_temp,
+                                   min_temp =    df_count_pjor_spdf@data$min_temp,
+                                   temp_range =  df_count_pjor_spdf@data$temp_range,
+                                   prec =        df_count_pjor_spdf@data$prec,
+                                   prec_season = df_count_pjor_spdf@data$prec_season,
+                                   year =        df_count_pjor_spdf@data$year),
+                    tag = "Obs")
+
+pred_stack_count <- inla.stack(data = list(y = NA),
+                    A = list(A_count_pred,
+                             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+                    effects = list(sf2 = s_ind_count,
+                                   Intercept =   rep(1, nrow(cov_df)),
+                                   slope =       cov_df$slope,
+                                   aspect =      cov_df$aspect,
+                                   ecolf_c =     cov_df$ecolf_c,
+                                   ecolf_d =     cov_df$ecolf_d,
+                                   tpi =         cov_df$tpi,
+                                   rough =       cov_df$rough,
+                                   flow =        cov_df$flow,
+                                   stream =      cov_df$stream,
+                                   trails =      cov_df$trails,
+                                   twi =         cov_df$twi,
+                                   elev =        cov_df$elev,
+                                   mean_temp =   cov_df$mean_temp,
+                                   temp_season = cov_df$temp_season,
+                                   max_temp =    cov_df$max_temp,
+                                   min_temp =    cov_df$min_temp,
+                                   temp_range =  cov_df$temp_range,
+                                   prec =        cov_df$prec,
+                                   prec_season = cov_df$prec_season),
+                    tag = "Pred")
+
+est_stack_count <- inla.stack(data = list(y = NA),
+                    A = list(A_count_est,
+                             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+                    effects = list(sf2 = s_ind_count,
+                                   Intercept =   rep(1, nrow(df_count_pjor_spdf)),
+                                   slope =       df_count_pjor_spdf@data$slope,
+                                   ecolf_c =     df_count_pjor_spdf@data$ecolf_c,
+                                   ecolf_d =     df_count_pjor_spdf@data$ecolf_d,
+                                   aspect =      df_count_pjor_spdf@data$aspect,
+                                   tpi =         df_count_pjor_spdf@data$tpi,
+                                   rough =       df_count_pjor_spdf@data$rough,
+                                   flow =        df_count_pjor_spdf@data$flow,
+                                   stream =      df_count_pjor_spdf@data$stream,
+                                   trails =      df_count_pjor_spdf@data$trails, 
+                                   twi =         df_count_pjor_spdf@data$twi,
+                                   elev =        df_count_pjor_spdf@data$elev,
+                                   mean_temp =   df_count_pjor_spdf@data$mean_temp,
+                                   temp_season = df_count_pjor_spdf@data$temp_season,
+                                   max_temp =    df_count_pjor_spdf@data$max_temp,
+                                   min_temp =    df_count_pjor_spdf@data$min_temp,
+                                   temp_range =  df_count_pjor_spdf@data$temp_range,
+                                   prec =        df_count_pjor_spdf@data$prec,
+                                   prec_season = df_count_pjor_spdf@data$prec_season,
+                                   year =        df_count_pjor_spdf@data$year),
+                    tag = "Est")
+
+all_stack_count <- inla.stack(obs_stack_count, pred_stack_count, est_stack_count)
+fit_stack_count <- inla.stack(obs_stack_count, est_stack_count)
+```
+
+```{r}
+# INLAstep_mods_bw <- INLAutils::INLAstep(fam1 = "poisson",
+#                           df_count_pjor_spdf@data,
+#                           in_stack = fit_stack_count,
+#                           invariant = "-1 + Intercept + f(sf2, model = count_spde)",
+#                           direction = "backwards",
+#                           include = 1:16,
+#                           y = "y",
+#                           y2 = "count",
+#                           num.threads = 4,
+#                           powerl = 1,
+#                           inter = 1,
+#                           thresh = 2); beep("phone.wav")
+# 
+# INLAstep_mods_bw$best_formula 
+# 
+# ggregplot::Efxplot(INLAstep_mods_bw$best_model)
+# 
+# INLAstep_mods_fw <- INLAutils::INLAstep(fam1 = "poisson",
+#                           df_count_pjor_spdf@data,
+#                           in_stack = fit_stack_count,
+#                           invariant = "-1 + Intercept + f(sf2, model = count_spde)",
+#                           direction = "forwards",
+#                           include = 1:16,
+#                           y = "y",
+#                           y2 = "count",
+#                           num.threads = 4,
+#                           powerl = 1,
+#                           inter = 1,
+#                           thresh = 2); beep("phone.wav")
+# 
+# INLAstep_mods_fw$best_formula
+# 
+# ggregplot::Efxplot(INLAstep_mods_fw$best_model)
+
+```
+
+#` tmax: elev & prec
+#` prec: elev & tmax
+#` slope: rough
+
+```{r}
+lin_formula_geo <- y ~ -1 + Intercept + elev + I(elev^2) + aspect + tpi + flow + stream + trails + twi + f(sf2, model = count_spde)
+lin_formula_geo_bio <- y ~ -1 + Intercept + ecolf_c + mean_temp + f(sf2, model = count_spde)
+
+lin_mod_geo_bio <- inla(lin_formula_geo_bio, 
+                        data = inla.stack.data(all_stack_count),
+                        family = "poisson",
+                        num.threads = 4,
+                        control.predictor = list(A = inla.stack.A(all_stack_count), compute = T),
+                        control.compute = list(cpo = TRUE, dic = TRUE)); beep("phone.wav"); lin_mod_geo_bio$summary.fixed
+
+lin_mod_geo <- inla(lin_formula_geo, 
+                    data = inla.stack.data(all_stack_count),
+                    family = "poisson",
+                    num.threads = 4,
+                    control.predictor = list(A = inla.stack.A(all_stack_count), compute = T),
+                    control.compute = list(cpo = TRUE, dic = TRUE)); beep("phone.wav"); lin_mod_geo$summary.fixed
+
+lin_mod_geo_bio$dic[c("dic")]
+lin_mod_geo$dic[c("dic")]
+
+Efxplot(lin_mod_geo_bio)
+ggplot_inla_residuals(lin_mod_geo_bio, df_count_pjor_spdf@data$count, binwidth = 0.1)
+
+```
+
+```{r}
+gg_lin_mod_ap <- autoplot(lin_mod_geo_bio)
+gg_lin_mod_ap$fixed.marginals
+
+lin_mod_fixed_summary <- lin_mod$summary.fixed %>%
+  rownames_to_column("var") %>%
+  mutate(sig = if_else(sign(`0.025quant`) == sign(`0.975quant`), "*", ""))
+
+gg_lin_mod_fixed_marg <- gg_lin_mod_ap$fixed.marginals$data %>%
+  bind_cols(mean = rep(lin_mod_fixed_summary$mean, each = 31),
+            sd = rep(lin_mod_fixed_summary$sd, each = 31),
+            lower95CI = rep(lin_mod_fixed_summary$`0.025quant`, each = 31),
+            upper95CI = rep(lin_mod_fixed_summary$`0.975quant`, each = 31),
+            lower80CI = rep(lin_mod_fixed_summary$mean - 1.282*lin_mod_fixed_summary$sd, each = 31),
+            upper80CI = rep(lin_mod_fixed_summary$mean + 1.282*lin_mod_fixed_summary$sd, each = 31),
+            lower50CI = rep(lin_mod_fixed_summary$mean - 0.674*lin_mod_fixed_summary$sd, each = 31),
+            upper50CI = rep(lin_mod_fixed_summary$mean + 0.674*lin_mod_fixed_summary$sd, each = 31))
+
+gg_lin_mod_fixed_marg_50CI <- gg_lin_mod_fixed_marg %>%
+  filter(!x < lower50CI,
+         !x > upper50CI)
+gg_lin_mod_fixed_marg_80CI <- gg_lin_mod_fixed_marg %>%
+  filter(!x < lower80CI,
+         !x > upper80CI)
+gg_lin_mod_fixed_marg_95CI <- gg_lin_mod_fixed_marg %>%
+  filter(!x < lower95CI,
+         !x > upper95CI)
+
+area_cols <- c(
+  "95%" = "grey80",
+  "80%" = "grey60",
+  "50%" = "grey40"
+               )
+
+line_cols <- c(
+  "Null effect" = "grey40"
+)
+
+facet_names <- c(
+  `aspect` = "Aspect",
+  `elev` = "Elevation",
+  `flow` = "Flow",
+  `I(elev^2)` = "Elevation^2",
+  `Intercept` = "Intercept",
+  `stream` = "Streams",
+  `tpi` = "TPI",
+  `trails` = "Trails",
+  `twi` = "TWI"
+) 
+
+ggplot(gg_lin_mod_fixed_marg, aes(x = x, y = y)) + 
+  geom_area(col = "grey20", fill = "grey90", alpha = 0.75, size = 0.1, show.legend = T) + 
+  geom_area(data = gg_lin_mod_fixed_marg_95CI, aes(x = x, y = y, group = var, fill = "95%"), alpha = 0.75) + 
+  geom_area(data = gg_lin_mod_fixed_marg_80CI, aes(x = x, y = y, group = var, fill = "80%"), alpha = 0.75) + 
+  geom_area(data = gg_lin_mod_fixed_marg_50CI, aes(x = x, y = y, group = var, fill = "50%"), alpha = 0.75) + 
+  geom_line(col = "grey20", size = 0.4) +
+  geom_vline(aes(xintercept = 0, col = "Null effect"), linetype = "dashed") +
+  facet_wrap(~var, labeller = as_labeller(facet_names), scales = "free") +
+  xlab(expression(Marginal~Distribution~of~Fixed~Effects~"("*hat(beta)*")")) + 
+  ylab("Probability Density") + 
+  theme_bw() + 
+  scale_fill_manual("Credible Interval", values = area_cols) + 
+  scale_color_manual(" ", values = line_cols) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()); ggsave("figures/parameter_estimates.png", height = 5, width = 6, dpi = 600)
+
+```
+
+```{r}
+# lin_mod_out_field <- inla.spde2.result(lin_mod,'sf2', count_spde, do.transf = TRUE)
+# lin_mod_range_field <- inla.emarginal(function(x) x,
+#                                       lin_mod_out_field$marginals.range.nominal[[1]])
+# 
+# parameters for the SLOO process
+# ss <- 20 # sample size to process (number of SLOO runs)
+# define the radius of the spatial buffer surrounding the removed point.
+# Make sure it isn't bigger than 25% of the study area (Le Rest et al.(2014))
+# rad <- min(lin_mod_range_field, max(dist(df_count_pjor_spdf@coords)) / 10)
+# alpha <- 0.05 # RMSE and MAE confidence intervals (1-alpha)
+# set.seed(199)
+# run the function to compare both models
+# cv <- inlasloo(dataframe = df_count_pjor_spdf@data,
+#                long = "Longitude",
+#                lat = "Latitude",
+#                y = "count",
+#                ss = ss,
+#                rad = 1,
+#                modform = list(lin_mod),
+#                mesh = df_count_pjor_spdf_mesh,
+#                family = 'poisson',
+#                mae = TRUE)
+```
+
+
+```{r}
+index_pred_pres <- inla.stack.index(all_stack_count, "Pred")$data
+index_est_pres <- inla.stack.index(all_stack_count, "Est")$data
+
+cov_df_lin_mod <- cov_df
+cov_df_lin_mod$pred <- lin_mod_geo$summary.fitted.values[index_pred_pres, "mean"] %>% exp()
+cov_df_lin_mod$sd <- lin_mod_geo$summary.fitted.values[index_pred_pres, "sd"]
+cov_df_lin_mod$lower_ci <- lin_mod_geo$summary.fitted.values[index_pred_pres, "0.025quant"] %>% exp()
+cov_df_lin_mod$upper_ci <- lin_mod_geo$summary.fitted.values[index_pred_pres, "0.975quant"] %>% exp()
+
+eco_lf_agg <- eco_lf_simp %>%
+  crop(gsmnp) %>%
+  mask(gsmnp) %>%
+  aggregate(fact = aggfact)
+
+eco_lf_agg_df <- as.data.frame(xyFromCell(eco_lf_agg, cell = 1:ncell(eco_lf_agg))) %>%
+  mutate(eco_lf = values(eco_lf_agg))
+cov_df_lin_mod$eco_lf <- eco_lf_agg_df$eco_lf
+cov_df_lin_mod$pred
+
+gg_lin_smooth <- ggplot(cov_df_lin_mod, aes(y = pred, x = eco_lf)) + 
+  stat_smooth(data = cov_df_lin_mod, aes(y = lower_ci, x = eco_lf), 
+              method = "glm", method.args = list(family = "quasipoisson"), 
+              se = F, col = "grey40") + 
+  stat_smooth(data = cov_df_lin_mod, aes(y = upper_ci, x = eco_lf), 
+              method = "glm", method.args = list(family = "quasipoisson"), 
+              se = F, col = "grey40")
+
+gg_lin_smooth_build <- ggplot_build(gg_lin_smooth)
+gg_lin_smooth_build_df <- data.frame(x = gg_lin_smooth_build$data[[1]]$x,
+                  ymin = gg_lin_smooth_build$data[[1]]$y,
+                  ymax = gg_lin_smooth_build$data[[2]]$y) 
+
+lin_mod_prev <- ggplot() + 
+  geom_ribbon(data = gg_lin_smooth_build_df, mapping = aes(x = x, ymin = ymin, ymax = ymax), fill = "grey", alpha = 0.4) +
+  geom_point(data = cov_df_lin_mod, mapping = aes(y = pred, x = eco_lf), alpha = 0.2, fill = NA, col = "grey40") +
+  stat_smooth(data = cov_df_lin_mod, mapping = aes(y = pred, x = eco_lf), 
+              method = "glm", method.args = list(family = "quasipoisson"), 
+              se = F, size = 2) + 
+  # ylim(0,2) + xlim(250, 2000) + 
+  ylab("Predicted Prevalence") + xlab("Ecolandform") + 
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5)); lin_mod_prev
+ggsave("figures/preds_lin_mod_elev_points.jpeg", width = 4, height = 3, units = "in", dpi = 600); beep("ping")
+```
+
+```{r}
+cov_stack_lin_mod <- cov_stack
+
+cov_stack_lin_mod$pred <-     lin_mod_geo_bio$summary.fitted.values[index_pred_pres, "mean"]
+cov_stack_lin_mod$sd <-       lin_mod_geo_bio$summary.fitted.values[index_pred_pres, "sd"]
+cov_stack_lin_mod$lower_ci <- lin_mod_geo_bio$summary.fitted.values[index_pred_pres, "0.025quant"]
+cov_stack_lin_mod$upper_ci <- lin_mod_geo_bio$summary.fitted.values[index_pred_pres, "0.975quant"]
+
+cov_stack_lin_mod_rm <- cov_stack_lin_mod %>%
+  # disaggregate(fact = 2, method = "bilinear") %>%
+  raster::crop(gsmnp_simp) %>%
+  raster::mask(gsmnp_simp)
+
+lin_mod_pred <- exp(cov_stack_lin_mod_rm$pred)
+lin_mod_sd <- cov_stack_lin_mod_rm$sd
+lin_mod_lower_ci <- exp(cov_stack_lin_mod_rm$lower_ci)
+lin_mod_upper_ci <- exp(cov_stack_lin_mod_rm$upper_ci)
+
+max <- 0.99
+lin_mod_pred[lin_mod_pred > quantile(lin_mod_pred, max)] <- quantile(lin_mod_pred, max)
+lin_mod_sd[lin_mod_sd > quantile(lin_mod_sd, max)] <- quantile(lin_mod_sd, max)
+lin_mod_lower_ci[lin_mod_lower_ci > quantile(lin_mod_lower_ci, max)] <- quantile(lin_mod_lower_ci, max)
+lin_mod_upper_ci[lin_mod_upper_ci > quantile(lin_mod_upper_ci, max)] <- quantile(lin_mod_upper_ci, max)
+
+gg_lin_mod_pred_count <- ggplot() +
+  geom_raster(data = as.data.frame(lin_mod_pred, xy=T), aes(x = x, y = y, fill = layer)) +
+  geom_polygon(data = gsmnp, aes(x = long, y = lat), col = "grey40", fill = NA, size = 0.5, alpha = 0.1) +
+  scale_fill_gradientn(colors = pal, na.value = NA, "Predicted Prevalence", 
+                       limits = c(0, cellStats(lin_mod_pred, "max")),
+                       breaks = c(0, cellStats(lin_mod_pred, "max")),
+                       labels = c(0.00, cellStats(lin_mod_pred, "max") %>% round(1))) +
+  theme_map() + theme(legend.position = "bottom")
+gg_lin_mod_uncert_count <- ggplot() +
+  geom_raster(data = as.data.frame(lin_mod_sd, xy=T), aes(x = x, y = y, fill = sd)) +
+  geom_polygon(data = gsmnp, aes(x = long, y = lat), col = "grey40", fill = NA, size = 0.5, alpha = 0.1) +
+  scale_fill_gradientn(colors = pal, na.value = NA, "Uncertainty", 
+                       limits = c(0, cellStats(lin_mod_sd, "max")),
+                       breaks = c(0, cellStats(lin_mod_sd, "max")),
+                       labels = c(0.00, cellStats(lin_mod_sd, "max") %>% round(1))) +
+  theme_map() + theme(legend.position = "bottom")
+gg_lin_mod_lowerCI_count <- ggplot() +
+  geom_raster(data = as.data.frame(lin_mod_lower_ci, xy=T), aes(x = x, y = y, fill = layer)) +
+  geom_polygon(data = gsmnp, aes(x = long, y = lat), col = "grey40", fill = NA, size = 0.5, alpha = 0.1) +
+  scale_fill_gradientn(colors = pal, na.value = NA, "Lower 95% CI", 
+                       limits = c(0, cellStats(lin_mod_lower_ci, "max")),
+                       breaks = c(0, cellStats(lin_mod_lower_ci, "max")),
+                       labels = c(0.00, cellStats(lin_mod_lower_ci, "max") %>% round(1))) +
+  theme_map() + theme(legend.position = "bottom")
+gg_lin_mod_upperCI_count <- ggplot() +
+  geom_raster(data = as.data.frame(lin_mod_upper_ci, xy=T), aes(x = x, y = y, fill = layer)) +
+  geom_polygon(data = gsmnp, aes(x = long, y = lat), col = "grey40", fill = NA, size = 0.5, alpha = 0.1) +
+  scale_fill_gradientn(colors = pal, na.value = NA, "Upper 95% CI", 
+                       limits = c(0, cellStats(lin_mod_upper_ci, "max")),
+                       breaks = c(0, cellStats(lin_mod_upper_ci, "max")),
+                       labels = c(0.00, cellStats(lin_mod_upper_ci, "max") %>% round(1))) +
+  theme_map() + theme(legend.position = "bottom")
+
+gg_sec_count_4 <- ggarrange(gg_lin_mod_pred_count, gg_lin_mod_uncert_count, 
+                            gg_lin_mod_lowerCI_count, gg_lin_mod_upperCI_count, 
+                            ncol = 2, nrow = 2)
+ggsave("figures/mod_lin_modeled_counts_4.jpeg", dpi = 600, width = 10, height = 6, units = "in"); beep("ping")
+
+```
